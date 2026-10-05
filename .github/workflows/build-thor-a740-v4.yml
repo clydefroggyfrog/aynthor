@@ -183,24 +183,32 @@ jobs:
           mkdir -p package out
           cp "$DRIVER" package/libvulkan_freedreno.so
 
-      - name: Package Eden driver
+      -       - name: Package Eden driver
         run: |
           MESA_VERSION="$(cat mesa/VERSION)"
           MESA_SHA="$(git -C mesa rev-parse --short=12 HEAD)"
+
+          echo "Mesa version: $MESA_VERSION"
+          echo "Mesa commit: $MESA_SHA"
+
+          mkdir -p package out
 
           cat > package/meta.json <<EOF
           {
             "schemaVersion": 1,
             "name": "Thor A740 Turnip",
-            "description": "Mesa Turnip driver for AYN Thor Adreno 740",
+            "description": "Custom Mesa Turnip Vulkan driver optimized for AYN Thor Adreno 740",
             "author": "Thor A740 Project",
             "packageVersion": "1",
             "vendor": "Mesa",
-            "driverVersion": "Mesa-${MESA_SHA}",
+            "driverVersion": "${MESA_VERSION}",
             "minApi": 28,
             "libraryName": "libvulkan_freedreno.so"
           }
           EOF
+
+          echo "meta.json:"
+          cat package/meta.json
 
           cd package
 
@@ -211,8 +219,7 @@ jobs:
 
           cd ..
 
-          echo "Finished package:"
-          ls -lh out/
+          echo "Driver ZIP contents:"
           unzip -l out/*.zip
 
       - name: Upload Thor A740 driver
