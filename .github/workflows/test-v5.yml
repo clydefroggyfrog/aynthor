@@ -1,0 +1,12 @@
+name: Test Thor A740 v5
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Test workflow
+        run: echo "Thor A740 workflow is working"
