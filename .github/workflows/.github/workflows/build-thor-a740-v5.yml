@@ -1,0 +1,106 @@
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          meta = json.loads(Path("package/meta.json").read_text())
+
+          required = {
+              "schemaVersion",
+              "name",
+              "author",
+              "packageVersion",
+              "vendor",
+              "driverVersion",
+              "minApi",
+              "libraryName",
+          }
+
+          missing = required - meta.keys()
+          if missing:
+              raise SystemExit(f"Missing metadata: {sorted(missing)}")
+
+          if meta["libraryName"] != "vulkan.ad07XX.so":
+              raise SystemExit("libraryName mismatch")
+
+          if meta["minApi"] != 33:
+              raise SystemExit("minApi is not API 33")
+
+          print("Metadata validation PASSED")
+          PY
+
+          DRIVER_ZIP="out/ThorA740-Turnip-API33-${MESA_VERSION}-${MESA_SHA}.zip"
+
+          (
+            cd package
+            zip -9 \
+              "../$DRIVER_ZIP" \
+              vulkan.ad07XX.so \
+              meta.json
+          )
+
+          echo "Created:"
+          ls -lh "$DRIVER_ZIP"
+
+      - name: Validate final driver ZIP
+        run: |
+          set -euxo pipefail
+
+          DRIVER_ZIP="$(find out \
+            -maxdepth 1 \
+            -type f \
+            -name '*.zip' \
+            -print \
+            -quit)"
+
+          test -n "$DRIVER_ZIP"
+          test -f "$DRIVER_ZIP"
+
+          echo "ZIP contents:"
+          unzip -l "$DRIVER_ZIP"
+
+          python3 - "$DRIVER_ZIP" <<'PY'
+          import json
+          import sys
+          import zipfile
+
+          path = sys.argv[1]
+
+          with zipfile.ZipFile(path, "r") as z:
+              files = {
+                  name
+                  for name in z.namelist()
+                  if not name.endswith("/")
+              }
+
+              expected = {
+                  "meta.json",
+                  "vulkan.ad07XX.so",
+              }
+
+              if files != expected:
+                  raise SystemExit(
+                      f"Unexpected ZIP contents: {sorted(files)}"
+                  )
+
+              meta = json.loads(
+                  z.read("meta.json").decode("utf-8")
+              )
+
+              if meta.get("name") is None:
+                  raise SystemExit("Driver name missing")
+
+              if meta.get("libraryName") != "vulkan.ad07XX.so":
+                  raise SystemExit("libraryName mismatch")
+
+              if meta.get("minApi") != 33:
+                  raise SystemExit("minApi mismatch")
+
+              print("Final package validation PASSED")
+          PY
+
+      - name: Upload Thor A740 API33 driver
+        uses: actions/upload-artifact@v6
+        with:
+          name: ThorA740-Turnip-API33
+          path: out/*.zip
+          if-no-files-found: error
