@@ -1,22 +1,77 @@
-      - name: Build balanced driver
-        env:
-          MESA_REF: ${{ inputs.mesa_ref }}
+name: Build Eden Thor A740 driver
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_ref:
+        description: "Mesa branch, tag, or commit"
+        required: true
+        default: "main"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout driver kit
+        uses: actions/checkout@v5
+
+      - name: Install build dependencies
         run: |
-          echo "=== STARTING BUILD ==="
-          echo "Current folder:"
-          pwd
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            curl \
+            unzip \
+            zip \
+            ninja-build \
+            pkg-config \
+            flex \
+            bison \
+            python3 \
+            python3-pip \
+            patchelf \
+            clang \
+            lld \
+            ccache
+
+          python3 -m pip install \
+            --break-system-packages \
+            -U meson mako pyyaml packaging
+
+      - name: Prepare build scripts
+        run: |
+          sed -i 's/\r$//' scripts/build.sh
+          sed -i 's/\r$//' scripts/patch_performance.py
+          chmod +x scripts/build.sh
 
           echo "Build script:"
           wc -l scripts/build.sh
           head -n 5 scripts/build.sh
 
-          echo "Running driver build..."
+      - name: Build balanced driver
+        env:
+          MESA_REF: ${{ inputs.mesa_ref }}
+        run: |
+          echo "=== STARTING BUILD ==="
+
           bash -x ./scripts/build.sh balanced
 
           echo "=== BUILD FINISHED ==="
 
-          echo "Contents of out:"
-          ls -lah out || true
+          echo "Output folder:"
+          ls -lah out/ || true
 
-          echo "Searching for driver files:"
-          find . -type f \( -name '*.zip' -o -name 'libvulkan_freedreno.so' \) -print
+          echo "Searching for driver:"
+          find . -type f \
+            \( -name '*.zip' -o -name 'libvulkan_freedreno.so' \) \
+            -print
+
+      - name: Upload driver package
+        if: success()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ThorA740-driver
+          path: out/
+          if-no-files-found: error
