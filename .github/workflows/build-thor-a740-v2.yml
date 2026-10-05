@@ -1,0 +1,99 @@
+name: Build Thor A740 v2
+
+run-name: Thor A740 v2 - ${{ inputs.mesa_ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_ref:
+        description: "Mesa branch, tag, or commit"
+        required: true
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout latest repository
+        uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            curl \
+            unzip \
+            zip \
+            ninja-build \
+            pkg-config \
+            flex \
+            bison \
+            python3 \
+            python3-pip \
+            patchelf \
+            clang \
+            lld \
+            ccache
+
+          python3 -m pip install \
+            --break-system-packages \
+            -U meson mako pyyaml packaging
+
+      - name: Verify build scripts
+        run: |
+          echo "=== REPOSITORY COMMIT ==="
+          git rev-parse HEAD
+
+          echo
+          echo "=== BUILD.SH ==="
+          test -f scripts/build.sh
+          wc -l scripts/build.sh
+          head -n 5 scripts/build.sh
+
+          echo
+          echo "=== PERFORMANCE PATCH ==="
+          test -f scripts/patch_performance.py
+          wc -l scripts/patch_performance.py
+          head -n 5 scripts/patch_performance.py
+
+          sed -i 's/\r$//' scripts/build.sh
+          sed -i 's/\r$//' scripts/patch_performance.py
+          chmod +x scripts/build.sh
+
+      - name: Build Thor A740 Balanced driver
+        env:
+          MESA_REF: ${{ inputs.mesa_ref }}
+        run: |
+          echo "========================================"
+          echo "STARTING THOR A740 TURNIP BUILD"
+          echo "========================================"
+
+          bash -x ./scripts/build.sh balanced
+
+      - name: Show build results
+        if: always()
+        run: |
+          echo "=== OUTPUT DIRECTORY ==="
+          ls -lah out/ 2>/dev/null || echo "No out directory"
+
+          echo
+          echo "=== DRIVER LIBRARIES ==="
+          find . -type f -name 'libvulkan_freedreno.so' -print || true
+
+          echo
+          echo "=== DRIVER PACKAGES ==="
+          find . -type f -name '*.zip' -print || true
+
+      - name: Upload Thor A740 driver
+        if: success()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ThorA740-Balanced
+          path: out/
+          if-no-files-found: error
