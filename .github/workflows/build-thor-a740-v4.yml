@@ -1,0 +1,223 @@
+name: Build Thor A740 v4
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_ref:
+        description: "Mesa branch, tag, or commit"
+        required: true
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl unzip zip \
+            ninja-build pkg-config \
+            flex bison \
+            clang lld llvm \
+            ccache \
+            python3 python3-pip \
+            patchelf \
+            glslang-tools \
+            patch
+
+          python3 -m pip install \
+            --break-system-packages \
+            -U meson mako pyyaml packaging
+
+      - name: Download Android NDK r29
+        run: |
+          curl -fL --retry 3 \
+            https://dl.google.com/android/repository/android-ndk-r29-linux.zip \
+            -o /tmp/android-ndk.zip
+
+          unzip -q /tmp/android-ndk.zip -d "$HOME"
+
+          echo "NDK=$HOME/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_ENV"
+
+      - name: Download Mesa
+        env:
+          MESA_REF: ${{ inputs.mesa_ref }}
+        run: |
+          git clone --filter=blob:none \
+            https://github.com/mirror/mesa.git mesa
+
+          git -C mesa fetch --depth=1 origin "$MESA_REF"
+          git -C mesa checkout --detach FETCH_HEAD
+
+          echo "Mesa commit:"
+          git -C mesa rev-parse HEAD
+
+          echo "Mesa version:"
+          cat mesa/VERSION
+
+      - name: Apply Android build fixes
+        working-directory: mesa
+        run: |
+          sed -i \
+            's/typedef const native_handle_t\* buffer_handle_t;/typedef void* buffer_handle_t;/g' \
+            include/android_stub/cutils/native_handle.h || true
+
+          sed -i \
+            's/, hnd->handle/, (void *)hnd->handle/g' \
+            src/util/u_gralloc/u_gralloc_fallback.c || true
+
+          sed -i -E \
+            's/([a-z_]+)->handle->/((const native_handle_t *)\1->handle)->/g' \
+            src/vulkan/runtime/vk_android.c || true
+
+          sed -i \
+            's/anb->handle->/((const native_handle_t *)anb->handle)->/g' \
+            src/vulkan/runtime/vk_android.c || true
+
+          sed -i \
+            "/-Werror=gnu-empty-initializer/d" \
+            meson.build || true
+
+      - name: Create Meson configuration
+        working-directory: mesa
+        run: |
+          if [ -f "$NDK/aarch64-linux-android36-clang" ]; then
+            API=36
+          elif [ -f "$NDK/aarch64-linux-android35-clang" ]; then
+            API=35
+          elif [ -f "$NDK/aarch64-linux-android34-clang" ]; then
+            API=34
+          else
+            echo "ERROR: Android ARM64 compiler not found"
+            exit 1
+          fi
+
+          echo "Using Android compiler API $API"
+
+          cat > android-aarch64.txt <<EOF
+          [binaries]
+          ar = '$NDK/llvm-ar'
+          c = ['$NDK/aarch64-linux-android${API}-clang']
+          cpp = ['$NDK/aarch64-linux-android${API}-clang++', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '--start-no-unused-arguments', '-static-libstdc++', '--end-no-unused-arguments']
+          c_ld = '$NDK/ld.lld'
+          cpp_ld = '$NDK/ld.lld'
+          strip = '$NDK/llvm-strip'
+          pkg-config = ['env', 'PKG_CONFIG_LIBDIR=/nonexistent', '/usr/bin/pkg-config']
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+          EOF
+
+          cat > native.txt <<EOF
+          [build_machine]
+          c = ['clang']
+          cpp = ['clang++']
+          ar = 'llvm-ar'
+          strip = 'llvm-strip'
+          c_ld = 'ld.lld'
+          cpp_ld = 'ld.lld'
+          system = 'linux'
+          cpu_family = 'x86_64'
+          cpu = 'x86_64'
+          endian = 'little'
+          EOF
+
+          cat android-aarch64.txt
+          cat native.txt
+
+      - name: Configure Turnip
+        working-directory: mesa
+        run: |
+          rm -rf build "$GITHUB_WORKSPACE/install"
+
+          meson setup build \
+            --cross-file android-aarch64.txt \
+            --native-file native.txt \
+            --prefix "$GITHUB_WORKSPACE/install" \
+            -Dbuildtype=release \
+            -Dstrip=true \
+            -Dplatforms=android \
+            -Dvideo-codecs= \
+            -Dplatform-sdk-version=36 \
+            -Dandroid-stub=true \
+            -Dgallium-drivers= \
+            -Dvulkan-drivers=freedreno \
+            -Dvulkan-beta=true \
+            -Dfreedreno-kmds=kgsl \
+            -Degl=disabled \
+            -Dandroid-libbacktrace=disabled
+
+      - name: Compile Turnip
+        working-directory: mesa
+        run: |
+          ninja -C build install
+
+      - name: Verify driver
+        run: |
+          echo "Install directory:"
+          find install -maxdepth 3 -type f -print
+
+          DRIVER="$(find install \
+            -type f \
+            -name libvulkan_freedreno.so \
+            -print \
+            -quit)"
+
+          if [ -z "$DRIVER" ]; then
+            echo "ERROR: libvulkan_freedreno.so was not generated"
+            exit 1
+          fi
+
+          mkdir -p package out
+          cp "$DRIVER" package/libvulkan_freedreno.so
+
+      - name: Package Eden driver
+        run: |
+          MESA_VERSION="$(cat mesa/VERSION)"
+          MESA_SHA="$(git -C mesa rev-parse --short=12 HEAD)"
+
+          cat > package/meta.json <<EOF
+          {
+            "schemaVersion": 1,
+            "name": "Thor A740 Turnip",
+            "description": "Mesa Turnip driver for AYN Thor Adreno 740",
+            "author": "Thor A740 Project",
+            "packageVersion": "1",
+            "vendor": "Mesa",
+            "driverVersion": "Mesa-${MESA_SHA}",
+            "minApi": 28,
+            "libraryName": "libvulkan_freedreno.so"
+          }
+          EOF
+
+          cd package
+
+          zip -9 \
+            "../out/ThorA740-Turnip-${MESA_SHA}.zip" \
+            libvulkan_freedreno.so \
+            meta.json
+
+          cd ..
+
+          echo "Finished package:"
+          ls -lh out/
+          unzip -l out/*.zip
+
+      - name: Upload Thor A740 driver
+        uses: actions/upload-artifact@v6
+        with:
+          name: ThorA740-Turnip-v4
+          path: out/
+          if-no-files-found: error
