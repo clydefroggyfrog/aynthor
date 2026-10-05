@@ -1,0 +1,222 @@
+name: Build Thor A740 v3 Direct
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_ref:
+        description: "Mesa branch, tag, or commit"
+        required: true
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            git \
+            curl \
+            unzip \
+            zip \
+            ninja-build \
+            pkg-config \
+            flex \
+            bison \
+            clang \
+            lld \
+            ccache \
+            python3 \
+            python3-pip \
+            patchelf
+
+          python3 -m pip install \
+            --break-system-packages \
+            -U meson mako pyyaml packaging
+
+      - name: Download Android NDK
+        run: |
+          echo "Downloading Android NDK r30..."
+
+          curl -fL --retry 3 \
+            https://dl.google.com/android/repository/android-ndk-r30-linux.zip \
+            -o /tmp/android-ndk.zip
+
+          unzip -q /tmp/android-ndk.zip -d "$HOME"
+
+          echo "NDK=$HOME/android-ndk-r30" >> "$GITHUB_ENV"
+
+          echo "NDK installed."
+          ls "$HOME/android-ndk-r30"
+
+      - name: Download Mesa
+        env:
+          MESA_REF: ${{ inputs.mesa_ref }}
+        run: |
+          echo "Downloading Mesa..."
+
+          git clone \
+            --filter=blob:none \
+            https://github.com/mirror/mesa.git \
+            mesa
+
+          git -C mesa fetch \
+            --depth=1 \
+            origin "$MESA_REF"
+
+          git -C mesa checkout \
+            --detach FETCH_HEAD
+
+          echo "Mesa commit:"
+          git -C mesa rev-parse HEAD
+
+          echo "Mesa version:"
+          cat mesa/VERSION
+
+      - name: Create Android cross compiler configuration
+        run: |
+          NDK_BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          cat > android-aarch64.txt <<EOF
+          [binaries]
+          c = ['ccache', '$NDK_BIN/aarch64-linux-android33-clang']
+          cpp = ['ccache', '$NDK_BIN/aarch64-linux-android33-clang++']
+          ar = '$NDK_BIN/llvm-ar'
+          strip = '$NDK_BIN/llvm-strip'
+          ranlib = '$NDK_BIN/llvm-ranlib'
+          c_ld = '$NDK_BIN/ld.lld'
+          cpp_ld = '$NDK_BIN/ld.lld'
+          pkg-config = ['env', 'PKG_CONFIG_LIBDIR=/nonexistent', '/usr/bin/pkg-config']
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+          EOF
+
+          cat > native.txt <<EOF
+          [binaries]
+          c = ['ccache', 'clang']
+          cpp = ['ccache', 'clang++']
+          ar = 'llvm-ar'
+          strip = 'llvm-strip'
+          c_ld = 'ld.lld'
+          cpp_ld = 'ld.lld'
+
+          [host_machine]
+          system = 'linux'
+          cpu_family = 'x86_64'
+          cpu = 'x86_64'
+          endian = 'little'
+          EOF
+
+          echo "Cross compiler configuration:"
+          cat android-aarch64.txt
+
+      - name: Configure Thor A740 Turnip
+        run: |
+          echo "Configuring Turnip..."
+
+          CC=clang CXX=clang++ meson setup \
+            build \
+            mesa \
+            --cross-file android-aarch64.txt \
+            --native-file native.txt \
+            --prefix "$GITHUB_WORKSPACE/install" \
+            -Dbuildtype=release \
+            -Db_ndebug=true \
+            -Dstrip=true \
+            -Dplatforms=android \
+            -Dplatform-sdk-version=33 \
+            -Dandroid-stub=true \
+            -Dandroid-libbacktrace=disabled \
+            -Dgallium-drivers= \
+            -Dvulkan-drivers=freedreno \
+            -Dvulkan-beta=true \
+            -Dfreedreno-kmds=kgsl \
+            -Degl=disabled \
+            -Dvideo-codecs=
+
+      - name: Compile Thor A740 Turnip
+        run: |
+          echo "Compiling Turnip..."
+          ninja -C build install
+
+      - name: Find driver
+        run: |
+          echo "Searching for libvulkan_freedreno.so..."
+
+          DRIVER="$(find install build \
+            -type f \
+            -name 'libvulkan_freedreno.so' \
+            -print \
+            -quit)"
+
+          if [ -z "$DRIVER" ]; then
+            echo "ERROR: Turnip driver was not generated."
+            exit 1
+          fi
+
+          echo "Driver found:"
+          echo "$DRIVER"
+
+          mkdir -p package out
+
+          cp "$DRIVER" \
+            package/libvulkan_freedreno.so
+
+      - name: Create Eden driver package
+        run: |
+          MESA_VERSION="$(cat mesa/VERSION)"
+          MESA_SHA="$(git -C mesa rev-parse --short=10 HEAD)"
+
+          echo "Mesa version: $MESA_VERSION"
+          echo "Mesa commit: $MESA_SHA"
+
+          cat > package/meta.json <<EOF
+          {
+            "schemaVersion": 1,
+            "name": "Thor A740 Turnip",
+            "description": "Turnip Vulkan driver for AYN Thor Snapdragon 8 Gen 2 / Adreno 740",
+            "author": "ThorA740 Project",
+            "packageVersion": "1",
+            "vendor": "Mesa",
+            "driverVersion": "${MESA_VERSION}-${MESA_SHA}",
+            "minApi": 33,
+            "libraryName": "libvulkan_freedreno.so"
+          }
+          EOF
+
+          cd package
+
+          zip -9 \
+            "../out/ThorA740-Turnip-${MESA_SHA}.zip" \
+            libvulkan_freedreno.so \
+            meta.json
+
+          cd ..
+
+          echo "Created driver:"
+          ls -lh out/
+
+          echo
+          echo "ZIP contents:"
+          unzip -l out/*.zip
+
+      - name: Upload Thor A740 driver
+        uses: actions/upload-artifact@v6
+        with:
+          name: ThorA740-Turnip
+          path: out/*.zip
+          if-no-files-found: error
