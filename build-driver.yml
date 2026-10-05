@@ -1,12 +1,22 @@
-      - name: Build balanced + performance packages
+      - name: Build balanced driver
         env:
           MESA_REF: ${{ inputs.mesa_ref }}
         run: |
-          echo "Using commit:"
-          git rev-parse HEAD
+          echo "=== STARTING BUILD ==="
+          echo "Current folder:"
+          pwd
 
-          echo "Build script size:"
+          echo "Build script:"
           wc -l scripts/build.sh
+          head -n 5 scripts/build.sh
 
-          echo "Starting driver build..."
-          bash -x ./scripts/build.sh both
+          echo "Running driver build..."
+          bash -x ./scripts/build.sh balanced
+
+          echo "=== BUILD FINISHED ==="
+
+          echo "Contents of out:"
+          ls -lah out || true
+
+          echo "Searching for driver files:"
+          find . -type f \( -name '*.zip' -o -name 'libvulkan_freedreno.so' \) -print
