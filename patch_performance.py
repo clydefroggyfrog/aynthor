@@ -1,21 +1,108 @@
 #!/usr/bin/env python3
+
 from pathlib import Path
 import sys
 
-p = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("mesa/src/freedreno/vulkan/tu_device.cc")
-text = p.read_text()
 
-old_pipeline = "&device->pipeline_suballoc, device, 128 * 1024,"
-new_pipeline = "&device->pipeline_suballoc, device, 512 * 1024,"
-old_kgsl = "128 * 1024, TU_BO_ALLOC_INTERNAL_RESOURCE,\n                              \"kgsl_profiling_suballoc\""
-new_kgsl = "512 * 1024, TU_BO_ALLOC_INTERNAL_RESOURCE,\n                              \"kgsl_profiling_suballoc\""
+if len(sys.argv) > 1:
+    path = Path(sys.argv[1])
+else:
+    path = Path(
+        "mesa/src/freedreno/vulkan/tu_device.cc"
+    )
 
-if old_pipeline not in text:
-    raise SystemExit("pipeline_suballoc pattern not found; Mesa changed, review patch before building")
-if old_kgsl not in text:
-    raise SystemExit("kgsl_profiling_suballoc pattern not found; Mesa changed, review patch before building")
 
-text = text.replace(old_pipeline, new_pipeline, 1)
-text = text.replace(old_kgsl, new_kgsl, 1)
-p.write_text(text)
-print("Applied ThorA740 performance suballocator patch (128 KiB -> 512 KiB).")
+if not path.exists():
+    raise SystemExit(
+        f"Turnip source file does not exist: {path}"
+    )
+
+
+text = path.read_text()
+
+
+pipeline_old = (
+    "&device->pipeline_suballoc, device, "
+    "128 * 1024,"
+)
+
+pipeline_new = (
+    "&device->pipeline_suballoc, device, "
+    "512 * 1024,"
+)
+
+
+kgsl_old = (
+    "128 * 1024, "
+    "TU_BO_ALLOC_INTERNAL_RESOURCE,"
+)
+
+kgsl_new = (
+    "512 * 1024, "
+    "TU_BO_ALLOC_INTERNAL_RESOURCE,"
+)
+
+
+changes = 0
+
+
+if pipeline_old in text:
+
+    text = text.replace(
+        pipeline_old,
+        pipeline_new,
+        1
+    )
+
+    changes += 1
+
+    print(
+        "Changed pipeline allocator "
+        "128 KiB -> 512 KiB"
+    )
+
+else:
+
+    print(
+        "Pipeline allocator pattern "
+        "was not found."
+    )
+
+
+if kgsl_old in text:
+
+    text = text.replace(
+        kgsl_old,
+        kgsl_new,
+        1
+    )
+
+    changes += 1
+
+    print(
+        "Changed KGSL allocator "
+        "128 KiB -> 512 KiB"
+    )
+
+else:
+
+    print(
+        "KGSL allocator pattern "
+        "was not found."
+    )
+
+
+if changes == 0:
+
+    raise SystemExit(
+        "Performance patch could not be applied. "
+        "Mesa source layout may have changed."
+    )
+
+
+path.write_text(text)
+
+
+print(
+    "Thor A740 performance patch applied."
+)
