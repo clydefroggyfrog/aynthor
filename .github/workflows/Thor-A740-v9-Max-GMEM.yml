@@ -1,0 +1,384 @@
+name: Build Thor A740 v9 Max GMEM
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_ref:
+        description: "Mesa branch, tag, or commit"
+        required: true
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install build tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl unzip zip ninja-build pkg-config \
+            flex bison clang lld llvm ccache \
+            python3 python3-pip patchelf glslang-tools patch file
+          python3 -m pip install --break-system-packages -U \
+            meson mako pyyaml packaging
+
+      - name: Download Android NDK r29
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 3 \
+            https://dl.google.com/android/repository/android-ndk-r29-linux.zip \
+            -o /tmp/android-ndk.zip
+
+          unzip -q /tmp/android-ndk.zip -d "$HOME"
+
+          NDK_ROOT="$HOME/android-ndk-r29"
+          NDK_BIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          echo "NDK_ROOT=$NDK_ROOT" >> "$GITHUB_ENV"
+          echo "NDK_BIN=$NDK_BIN" >> "$GITHUB_ENV"
+
+          test -x "$NDK_BIN/aarch64-linux-android33-clang"
+          test -x "$NDK_BIN/aarch64-linux-android33-clang++"
+
+      - name: Download newest Mesa
+        env:
+          MESA_REF: ${{ inputs.mesa_ref }}
+        run: |
+          set -euxo pipefail
+          rm -rf mesa
+
+          git clone --filter=blob:none \
+            https://github.com/mirror/mesa.git \
+            mesa
+
+          git -C mesa fetch --depth=1 origin "$MESA_REF"
+          git -C mesa checkout --detach FETCH_HEAD
+
+          echo "Mesa commit:"
+          git -C mesa rev-parse HEAD
+
+          echo "Mesa version:"
+          cat mesa/VERSION
+
+      - name: Apply Android compatibility fixes
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          sed -i \
+            's/typedef const native_handle_t\* buffer_handle_t;/typedef void* buffer_handle_t;/g' \
+            include/android_stub/cutils/native_handle.h || true
+
+          sed -i \
+            's/, hnd->handle/, (void *)hnd->handle/g' \
+            src/util/u_gralloc/u_gralloc_fallback.c || true
+
+          sed -i -E \
+            's/([a-z_]+)->handle->/((const native_handle_t *)\1->handle)->/g' \
+            src/vulkan/runtime/vk_android.c || true
+
+          sed -i \
+            's/anb->handle->/((const native_handle_t *)anb->handle)->/g' \
+            src/vulkan/runtime/vk_android.c || true
+
+          sed -i \
+            "/-Werror=gnu-empty-initializer/d" \
+            meson.build || true
+
+      - name: Apply Thor A740 v9 Max-GMEM patch
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          p = Path("src/freedreno/vulkan/tu_autotune.cc")
+          if not p.exists():
+              raise SystemExit("ERROR: tu_autotune.cc not found")
+
+          s = p.read_text()
+
+          # 1) Make Prefer-GMEM the default algorithm.
+          algo_pattern = (
+              r"DEFAULT\s*=\s*"
+              r"(?:BANDWIDTH|PROFILED|PROFILED_IMM|PREFER_GMEM|PREFER_SYSMEM)"
+          )
+          m = re.search(algo_pattern, s)
+          if not m:
+              raise SystemExit("ERROR: autotune DEFAULT selector not found")
+
+          print("Old autotune selector:", m.group(0))
+          s, n = re.subn(
+              algo_pattern,
+              "DEFAULT = PREFER_GMEM",
+              s,
+              count=1
+          )
+          if n != 1:
+              raise SystemExit("ERROR: failed to patch PREFER_GMEM")
+
+          # 2) Enable TUNE_SMALL by default.
+          # This prevents tiny render passes from returning SYSMEM before
+          # Prefer-GMEM gets a chance to select the rendering mode.
+          flags_pattern = r"uint32_t mod_flags\s*=\s*0\s*;"
+          if re.search(flags_pattern, s):
+              s, n = re.subn(
+                  flags_pattern,
+                  "uint32_t mod_flags = (uint32_t) mod_flag::TUNE_SMALL;",
+                  s,
+                  count=1
+              )
+              if n != 1:
+                  raise SystemExit("ERROR: failed to enable TUNE_SMALL")
+              print("Enabled TUNE_SMALL by default")
+          else:
+              raise SystemExit("ERROR: mod_flags initialization not found")
+
+          # 3) Aggressive fallback: use GMEM when the complex autotuner path
+          # is unavailable/disabled, including simultaneous-use command buffers.
+          fallback_pattern = (
+              r"constexpr\s+render_mode\s+default_mode\s*=\s*"
+              r"render_mode::SYSMEM\s*;"
+          )
+          if re.search(fallback_pattern, s):
+              s, n = re.subn(
+                  fallback_pattern,
+                  "constexpr render_mode default_mode = render_mode::GMEM;",
+                  s,
+                  count=1
+              )
+              if n != 1:
+                  raise SystemExit("ERROR: failed to set GMEM fallback")
+              print("Changed fallback render mode to GMEM")
+          else:
+              raise SystemExit("ERROR: default_mode SYSMEM selector not found")
+
+          # 4) If an older source accidentally defaults concurrent binning on,
+          # force the drirc default back off. Current Mesa already does this.
+          d = Path("src/freedreno/vulkan/tu_device.cc")
+          if d.exists():
+              ds = d.read_text()
+              if "DRI_CONF_TU_ALLOW_CONCURRENT_BINNING(true)" in ds:
+                  ds = ds.replace(
+                      "DRI_CONF_TU_ALLOW_CONCURRENT_BINNING(true)",
+                      "DRI_CONF_TU_ALLOW_CONCURRENT_BINNING(false)",
+                      1
+                  )
+                  d.write_text(ds)
+                  print("Disabled concurrent binning default")
+
+          p.write_text(s)
+
+          verify = p.read_text()
+          checks = [
+              "DEFAULT = PREFER_GMEM",
+              "mod_flag::TUNE_SMALL",
+              "default_mode = render_mode::GMEM",
+          ]
+          missing = [x for x in checks if x not in verify]
+          if missing:
+              raise SystemExit(f"ERROR: verification failed: {missing}")
+
+          print("Thor v9 Max-GMEM patch applied")
+          PY
+
+          echo
+          echo "Patched autotuner selectors:"
+          grep -n -E \
+            'DEFAULT = (BANDWIDTH|PROFILED|PROFILED_IMM|PREFER_GMEM|PREFER_SYSMEM)|mod_flags =|default_mode = render_mode::' \
+            src/freedreno/vulkan/tu_autotune.cc | head -30
+
+          echo
+          echo "Concurrent binning default:"
+          grep -n \
+            'TU_ALLOW_CONCURRENT_BINNING' \
+            src/freedreno/vulkan/tu_device.cc | head -10 || true
+
+      - name: Create Android API33 cross file
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          cat > android-aarch64.txt <<EOF
+          [binaries]
+          ar = '$NDK_BIN/llvm-ar'
+          c = ['ccache', '$NDK_BIN/aarch64-linux-android33-clang']
+          cpp = ['ccache', '$NDK_BIN/aarch64-linux-android33-clang++', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '--start-no-unused-arguments', '-static-libstdc++', '--end-no-unused-arguments']
+          c_ld = '$NDK_BIN/ld.lld'
+          cpp_ld = '$NDK_BIN/ld.lld'
+          strip = '$NDK_BIN/llvm-strip'
+          ranlib = '$NDK_BIN/llvm-ranlib'
+          pkg-config = ['env', 'PKG_CONFIG_LIBDIR=/nonexistent', '/usr/bin/pkg-config']
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+          EOF
+
+          cat > native.txt <<EOF
+          [binaries]
+          c = ['ccache', 'clang']
+          cpp = ['ccache', 'clang++']
+          ar = 'llvm-ar'
+          strip = 'llvm-strip'
+          c_ld = 'ld.lld'
+          cpp_ld = 'ld.lld'
+
+          [host_machine]
+          system = 'linux'
+          cpu_family = 'x86_64'
+          cpu = 'x86_64'
+          endian = 'little'
+          EOF
+
+      - name: Configure Turnip v9
+        working-directory: mesa
+        env:
+          CC: clang
+          CXX: clang++
+          AR: llvm-ar
+          RANLIB: llvm-ranlib
+          STRIP: llvm-strip
+          OBJDUMP: llvm-objdump
+          OBJCOPY: llvm-objcopy
+          LDFLAGS: -fuse-ld=lld
+        run: |
+          set -euxo pipefail
+
+          rm -rf build-android-aarch64
+          rm -rf /tmp/turnip-thor-v9
+
+          meson setup build-android-aarch64 \
+            --cross-file android-aarch64.txt \
+            --native-file native.txt \
+            --prefix /tmp/turnip-thor-v9 \
+            -Dbuildtype=release \
+            -Db_ndebug=true \
+            -Db_lto=false \
+            -Dstrip=true \
+            -Dplatforms=android \
+            -Dplatform-sdk-version=33 \
+            -Dandroid-stub=true \
+            -Dandroid-libbacktrace=disabled \
+            -Degl=disabled \
+            -Dgallium-drivers= \
+            -Dvulkan-drivers=freedreno \
+            -Dvulkan-beta=true \
+            -Dfreedreno-kmds=kgsl \
+            -Dvideo-codecs=
+
+      - name: Compile Turnip
+        working-directory: mesa
+        run: |
+          set -o pipefail
+          ninja -v -C build-android-aarch64 install 2>&1 \
+            | tee /tmp/thor-v9-build.log
+
+      - name: Inspect compiled driver
+        run: |
+          set -euxo pipefail
+
+          DRIVER="$(find /tmp/turnip-thor-v9 mesa/build-android-aarch64 \
+            -type f -name 'libvulkan_freedreno.so' -print -quit)"
+
+          if [ -z "$DRIVER" ] || [ ! -f "$DRIVER" ]; then
+            echo "ERROR: libvulkan_freedreno.so was not produced."
+            tail -200 /tmp/thor-v9-build.log || true
+            exit 1
+          fi
+
+          file "$DRIVER"
+          patchelf --print-needed "$DRIVER" || true
+
+      - name: Package Eden driver
+        run: |
+          set -euxo pipefail
+
+          DRIVER="$(find /tmp/turnip-thor-v9 mesa/build-android-aarch64 \
+            -type f -name 'libvulkan_freedreno.so' -print -quit)"
+
+          MESA_VERSION="$(tr -d '\r\n' < mesa/VERSION)"
+          MESA_SHA="$(git -C mesa rev-parse --short=12 HEAD)"
+
+          rm -rf package out
+          mkdir -p package out
+
+          cp "$DRIVER" package/libvulkan_freedreno.so
+          "$NDK_BIN/llvm-strip" \
+            --strip-unneeded package/libvulkan_freedreno.so || true
+
+          cat > package/meta.json <<EOF
+          {
+            "schemaVersion": 1,
+            "name": "Thor A740 v9 Max GMEM",
+            "description": "Experimental maximum-GMEM Turnip driver for AYN Thor Snapdragon 8 Gen 2 / Adreno 740 and Eden. Prefer-GMEM, TUNE_SMALL, GMEM fallback, concurrent-binning default off.",
+            "author": "Thor A740 Project",
+            "packageVersion": "9-max-gmem",
+            "vendor": "Mesa",
+            "driverVersion": "${MESA_VERSION}-${MESA_SHA}",
+            "minApi": 33,
+            "libraryName": "libvulkan_freedreno.so"
+          }
+          EOF
+
+          ZIP="out/ThorA740-v9-Max-GMEM-${MESA_VERSION}-${MESA_SHA}.zip"
+
+          (
+            cd package
+            zip -9 "../$ZIP" \
+              libvulkan_freedreno.so \
+              meta.json
+          )
+
+          echo "Created:"
+          ls -lh "$ZIP"
+          unzip -l "$ZIP"
+
+      - name: Validate Eden package
+        run: |
+          set -euxo pipefail
+
+          ZIP="$(find out -maxdepth 1 -type f -name '*.zip' -print -quit)"
+          test -n "$ZIP"
+
+          python3 - "$ZIP" <<'PY'
+          import json
+          import sys
+          import zipfile
+
+          p = sys.argv[1]
+
+          with zipfile.ZipFile(p) as z:
+              files = {x for x in z.namelist() if not x.endswith("/")}
+              expected = {"meta.json", "libvulkan_freedreno.so"}
+
+              if files != expected:
+                  raise SystemExit(f"Wrong ZIP contents: {sorted(files)}")
+
+              meta = json.loads(z.read("meta.json"))
+              assert meta["libraryName"] == "libvulkan_freedreno.so"
+              assert meta["minApi"] == 33
+              assert meta["packageVersion"] == "9-max-gmem"
+
+          print("Thor A740 v9 package validation PASSED")
+          PY
+
+      - name: Upload Thor A740 v9 driver
+        uses: actions/upload-artifact@v6
+        with:
+          name: ThorA740-v9-Max-GMEM
+          path: out/*.zip
+          if-no-files-found: error
