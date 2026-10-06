@@ -1,0 +1,400 @@
+name: Build Thor A740 v10 SyncBoost
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_ref:
+        description: "Mesa branch, tag, or commit"
+        required: true
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install build tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl unzip zip ninja-build pkg-config \
+            flex bison clang lld llvm ccache \
+            python3 python3-pip patchelf glslang-tools patch file
+          python3 -m pip install --break-system-packages -U \
+            meson mako pyyaml packaging
+
+      - name: Download Android NDK r29
+        run: |
+          set -euxo pipefail
+
+          curl -fL --retry 3 \
+            https://dl.google.com/android/repository/android-ndk-r29-linux.zip \
+            -o /tmp/android-ndk.zip
+
+          unzip -q /tmp/android-ndk.zip -d "$HOME"
+
+          NDK_ROOT="$HOME/android-ndk-r29"
+          NDK_BIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          echo "NDK_ROOT=$NDK_ROOT" >> "$GITHUB_ENV"
+          echo "NDK_BIN=$NDK_BIN" >> "$GITHUB_ENV"
+
+          test -x "$NDK_BIN/aarch64-linux-android33-clang"
+          test -x "$NDK_BIN/aarch64-linux-android33-clang++"
+
+      - name: Download current Mesa
+        env:
+          MESA_REF: ${{ inputs.mesa_ref }}
+        run: |
+          set -euxo pipefail
+          rm -rf mesa
+
+          git clone --filter=blob:none \
+            https://github.com/mirror/mesa.git \
+            mesa
+
+          git -C mesa fetch --depth=1 origin "$MESA_REF"
+          git -C mesa checkout --detach FETCH_HEAD
+
+          echo "Mesa commit:"
+          git -C mesa rev-parse HEAD
+
+          echo "Mesa version:"
+          cat mesa/VERSION
+
+      - name: Apply Android compatibility fixes
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          sed -i \
+            's/typedef const native_handle_t\* buffer_handle_t;/typedef void* buffer_handle_t;/g' \
+            include/android_stub/cutils/native_handle.h || true
+
+          sed -i \
+            's/, hnd->handle/, (void *)hnd->handle/g' \
+            src/util/u_gralloc/u_gralloc_fallback.c || true
+
+          sed -i -E \
+            's/([a-z_]+)->handle->/((const native_handle_t *)\1->handle)->/g' \
+            src/vulkan/runtime/vk_android.c || true
+
+          sed -i \
+            's/anb->handle->/((const native_handle_t *)anb->handle)->/g' \
+            src/vulkan/runtime/vk_android.c || true
+
+          sed -i \
+            "/-Werror=gnu-empty-initializer/d" \
+            meson.build || true
+
+      - name: Download KGSL SyncBoost fixes
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          mkdir -p /tmp/thor-patches
+
+          curl -fL --retry 3 \
+            https://raw.githubusercontent.com/The412Banner/Banners-Turnip/A8xx/patches/common/kgsl-zero-timeout-poll.patch \
+            -o /tmp/thor-patches/kgsl-zero-timeout-poll.patch
+
+          curl -fL --retry 3 \
+            https://raw.githubusercontent.com/The412Banner/Banners-Turnip/A8xx/patches/common/kgsl-syncobj-merge-ts-fd.patch \
+            -o /tmp/thor-patches/kgsl-syncobj-merge-ts-fd.patch
+
+          echo "Downloaded patches:"
+          wc -l /tmp/thor-patches/*.patch
+
+      - name: Apply KGSL SyncBoost fixes
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          apply_or_verify () {
+            PATCH_FILE="$1"
+            PATCH_NAME="$(basename "$PATCH_FILE")"
+
+            echo "Checking $PATCH_NAME"
+
+            if git apply --check "$PATCH_FILE"; then
+              echo "Applying $PATCH_NAME"
+              git apply "$PATCH_FILE"
+              return 0
+            fi
+
+            # If reverse application succeeds, the fix is already present.
+            if git apply --reverse --check "$PATCH_FILE"; then
+              echo "$PATCH_NAME already present in this Mesa revision"
+              return 0
+            fi
+
+            echo "ERROR: $PATCH_NAME does not apply and is not already present."
+            echo "Mesa changed underneath this patch; refusing to silently build without it."
+            exit 1
+          }
+
+          apply_or_verify /tmp/thor-patches/kgsl-zero-timeout-poll.patch
+          apply_or_verify /tmp/thor-patches/kgsl-syncobj-merge-ts-fd.patch
+
+          echo
+          echo "KGSL SyncBoost patch status:"
+          git diff --stat || true
+          git diff -- src/freedreno/vulkan/tu_knl_kgsl.cc | head -220 || true
+
+      - name: Apply Thor A740 Prefer-GMEM tuning
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          p = Path("src/freedreno/vulkan/tu_autotune.cc")
+          if not p.exists():
+              raise SystemExit("ERROR: tu_autotune.cc not found")
+
+          s = p.read_text()
+
+          pattern = (
+              r"DEFAULT\s*=\s*"
+              r"(?:BANDWIDTH|PROFILED|PROFILED_IMM|PREFER_GMEM|PREFER_SYSMEM)"
+          )
+
+          m = re.search(pattern, s)
+          if not m:
+              raise SystemExit("ERROR: Turnip autotune DEFAULT selector not found")
+
+          old = m.group(0)
+          s, count = re.subn(
+              pattern,
+              "DEFAULT = PREFER_GMEM",
+              s,
+              count=1
+          )
+
+          if count != 1:
+              raise SystemExit("ERROR: failed to select PREFER_GMEM")
+
+          # Keep small-pass behavior stock. v9's aggressive TUNE_SMALL/forced
+          # GMEM path did not produce a large gain, so v10 avoids that overhead.
+          p.write_text(s)
+
+          verify = p.read_text()
+          if "DEFAULT = PREFER_GMEM" not in verify:
+              raise SystemExit("ERROR: PREFER_GMEM verification failed")
+
+          print("Old:", old)
+          print("New: DEFAULT = PREFER_GMEM")
+          print("Small-render-pass handling remains stock.")
+          PY
+
+          grep -n -E \
+            'DEFAULT = (BANDWIDTH|PROFILED|PROFILED_IMM|PREFER_GMEM|PREFER_SYSMEM)' \
+            src/freedreno/vulkan/tu_autotune.cc | head -10
+
+      - name: Create Android API33 cross file
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          cat > android-aarch64.txt <<EOF
+          [binaries]
+          ar = '$NDK_BIN/llvm-ar'
+          c = ['ccache', '$NDK_BIN/aarch64-linux-android33-clang']
+          cpp = ['ccache', '$NDK_BIN/aarch64-linux-android33-clang++', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '--start-no-unused-arguments', '-static-libstdc++', '--end-no-unused-arguments']
+          c_ld = '$NDK_BIN/ld.lld'
+          cpp_ld = '$NDK_BIN/ld.lld'
+          strip = '$NDK_BIN/llvm-strip'
+          ranlib = '$NDK_BIN/llvm-ranlib'
+          pkg-config = ['env', 'PKG_CONFIG_LIBDIR=/nonexistent', '/usr/bin/pkg-config']
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+          EOF
+
+          cat > native.txt <<EOF
+          [binaries]
+          c = ['ccache', 'clang']
+          cpp = ['ccache', 'clang++']
+          ar = 'llvm-ar'
+          strip = 'llvm-strip'
+          c_ld = 'ld.lld'
+          cpp_ld = 'ld.lld'
+
+          [host_machine]
+          system = 'linux'
+          cpu_family = 'x86_64'
+          cpu = 'x86_64'
+          endian = 'little'
+          EOF
+
+      - name: Configure Turnip v10
+        working-directory: mesa
+        env:
+          CC: clang
+          CXX: clang++
+          AR: llvm-ar
+          RANLIB: llvm-ranlib
+          STRIP: llvm-strip
+          OBJDUMP: llvm-objdump
+          OBJCOPY: llvm-objcopy
+          LDFLAGS: -fuse-ld=lld
+        run: |
+          set -euxo pipefail
+
+          rm -rf build-android-aarch64
+          rm -rf /tmp/turnip-thor-v10
+
+          meson setup build-android-aarch64 \
+            --cross-file android-aarch64.txt \
+            --native-file native.txt \
+            --prefix /tmp/turnip-thor-v10 \
+            -Dbuildtype=release \
+            -Db_ndebug=true \
+            -Db_lto=false \
+            -Dstrip=true \
+            -Dplatforms=android \
+            -Dplatform-sdk-version=33 \
+            -Dandroid-stub=true \
+            -Dandroid-libbacktrace=disabled \
+            -Degl=disabled \
+            -Dgallium-drivers= \
+            -Dvulkan-drivers=freedreno \
+            -Dvulkan-beta=true \
+            -Dfreedreno-kmds=kgsl \
+            -Dvideo-codecs=
+
+      - name: Compile Turnip v10
+        working-directory: mesa
+        run: |
+          set -o pipefail
+
+          ninja -v -C build-android-aarch64 install 2>&1 \
+            | tee /tmp/thor-v10-build.log
+
+      - name: Inspect compiled driver
+        run: |
+          set -euxo pipefail
+
+          DRIVER="$(find /tmp/turnip-thor-v10 mesa/build-android-aarch64 \
+            -type f -name 'libvulkan_freedreno.so' -print -quit)"
+
+          if [ -z "$DRIVER" ] || [ ! -f "$DRIVER" ]; then
+            echo "ERROR: libvulkan_freedreno.so was not produced."
+            echo "Last 200 build-log lines:"
+            tail -200 /tmp/thor-v10-build.log || true
+            exit 1
+          fi
+
+          echo "Driver:"
+          file "$DRIVER"
+
+          echo "Dependencies:"
+          patchelf --print-needed "$DRIVER" || true
+
+      - name: Package Eden driver
+        run: |
+          set -euxo pipefail
+
+          DRIVER="$(find /tmp/turnip-thor-v10 mesa/build-android-aarch64 \
+            -type f -name 'libvulkan_freedreno.so' -print -quit)"
+
+          MESA_VERSION="$(tr -d '\r\n' < mesa/VERSION)"
+          MESA_SHA="$(git -C mesa rev-parse --short=12 HEAD)"
+
+          rm -rf package out
+          mkdir -p package out
+
+          cp "$DRIVER" package/libvulkan_freedreno.so
+
+          "$NDK_BIN/llvm-strip" \
+            --strip-unneeded \
+            package/libvulkan_freedreno.so || true
+
+          cat > package/meta.json <<EOF
+          {
+            "schemaVersion": 1,
+            "name": "Thor A740 v10 SyncBoost",
+            "description": "AYN Thor Snapdragon 8 Gen 2 / Adreno 740 experimental Turnip build for Eden. Prefer-GMEM plus KGSL zero-timeout polling and sync-object merge fixes; stock small-pass behavior.",
+            "author": "Thor A740 Project",
+            "packageVersion": "10-syncboost",
+            "vendor": "Mesa",
+            "driverVersion": "${MESA_VERSION}-${MESA_SHA}",
+            "minApi": 33,
+            "libraryName": "libvulkan_freedreno.so"
+          }
+          EOF
+
+          ZIP="out/ThorA740-v10-SyncBoost-${MESA_VERSION}-${MESA_SHA}.zip"
+
+          (
+            cd package
+            zip -9 "../$ZIP" \
+              libvulkan_freedreno.so \
+              meta.json
+          )
+
+          echo "Created:"
+          ls -lh "$ZIP"
+
+          echo "Contents:"
+          unzip -l "$ZIP"
+
+      - name: Validate Eden package
+        run: |
+          set -euxo pipefail
+
+          ZIP="$(find out -maxdepth 1 -type f -name '*.zip' -print -quit)"
+          test -n "$ZIP"
+          test -f "$ZIP"
+
+          python3 - "$ZIP" <<'PY'
+          import json
+          import sys
+          import zipfile
+
+          path = sys.argv[1]
+
+          with zipfile.ZipFile(path) as z:
+              files = {
+                  x for x in z.namelist()
+                  if not x.endswith("/")
+              }
+
+              expected = {
+                  "meta.json",
+                  "libvulkan_freedreno.so"
+              }
+
+              if files != expected:
+                  raise SystemExit(
+                      f"Wrong ZIP contents: {sorted(files)}"
+                  )
+
+              meta = json.loads(z.read("meta.json"))
+
+              assert meta["libraryName"] == "libvulkan_freedreno.so"
+              assert meta["minApi"] == 33
+              assert meta["packageVersion"] == "10-syncboost"
+
+          print("Thor A740 v10 SyncBoost package validation PASSED")
+          PY
+
+      - name: Upload Thor A740 v10 driver
+        uses: actions/upload-artifact@v6
+        with:
+          name: ThorA740-v10-SyncBoost
+          path: out/*.zip
+          if-no-files-found: error
