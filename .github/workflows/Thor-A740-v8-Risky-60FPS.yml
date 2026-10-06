@@ -1,0 +1,377 @@
+name: Build Thor A740 v8 Risky Performance
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_ref:
+        description: "Whitebelyash Mesa branch, tag, or commit"
+        required: true
+        default: "turnip/gen8"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install build tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl unzip zip ninja-build pkg-config \
+            flex bison clang lld llvm ccache \
+            python3 python3-pip patchelf glslang-tools patch file
+          python3 -m pip install --break-system-packages -U \
+            meson mako pyyaml packaging
+
+      - name: Download Android NDK r29
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 3 \
+            https://dl.google.com/android/repository/android-ndk-r29-linux.zip \
+            -o /tmp/android-ndk.zip
+
+          unzip -q /tmp/android-ndk.zip -d "$HOME"
+
+          NDK_ROOT="$HOME/android-ndk-r29"
+          NDK_BIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          echo "NDK_ROOT=$NDK_ROOT" >> "$GITHUB_ENV"
+          echo "NDK_BIN=$NDK_BIN" >> "$GITHUB_ENV"
+
+          test -x "$NDK_BIN/aarch64-linux-android33-clang"
+          test -x "$NDK_BIN/aarch64-linux-android33-clang++"
+
+      - name: Download Whitebelyash Turnip source
+        env:
+          MESA_REF: ${{ inputs.mesa_ref }}
+        run: |
+          set -euxo pipefail
+          rm -rf mesa
+
+          git clone \
+            --filter=blob:none \
+            --no-single-branch \
+            https://github.com/whitebelyash/mesa-unified.git \
+            mesa
+
+          git -C mesa fetch --depth=1 origin "$MESA_REF"
+          git -C mesa checkout --detach FETCH_HEAD
+
+          echo "Mesa commit:"
+          git -C mesa rev-parse HEAD
+          echo "Mesa version:"
+          cat mesa/VERSION
+
+      - name: Apply Android compatibility fixes
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          sed -i \
+            's/typedef const native_handle_t\* buffer_handle_t;/typedef void* buffer_handle_t;/g' \
+            include/android_stub/cutils/native_handle.h || true
+
+          sed -i \
+            's/, hnd->handle/, (void *)hnd->handle/g' \
+            src/util/u_gralloc/u_gralloc_fallback.c || true
+
+          sed -i -E \
+            's/([a-z_]+)->handle->/((const native_handle_t *)\1->handle)->/g' \
+            src/vulkan/runtime/vk_android.c || true
+
+          sed -i \
+            's/anb->handle->/((const native_handle_t *)anb->handle)->/g' \
+            src/vulkan/runtime/vk_android.c || true
+
+          sed -i \
+            "/-Werror=gnu-empty-initializer/d" \
+            meson.build || true
+
+      - name: Apply risky A740 render-path tuning
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          p = Path("src/freedreno/vulkan/tu_autotune.cc")
+          if not p.exists():
+              raise SystemExit("ERROR: tu_autotune.cc not found")
+
+          s = p.read_text()
+
+          # Prefer GMEM as the default algorithm.
+          # This still allows high-confidence SYSMEM decisions in Turnip.
+          pattern = r"DEFAULT\s*=\s*(?:BANDWIDTH|PROFILED|PROFILED_IMM|PREFER_GMEM|PREFER_SYSMEM)"
+          match = re.search(pattern, s)
+          if not match:
+              raise SystemExit("ERROR: could not find Turnip autotune DEFAULT selector")
+
+          s, count = re.subn(
+              pattern,
+              "DEFAULT = PREFER_GMEM",
+              s,
+              count=1
+          )
+
+          if count != 1:
+              raise SystemExit("ERROR: failed to patch autotune default")
+
+          # If this source exposes a profiling warmup count, make it react faster.
+          if "MIN_PROFILE_DURATION_COUNT = 5" in s:
+              s = s.replace(
+                  "MIN_PROFILE_DURATION_COUNT = 5",
+                  "MIN_PROFILE_DURATION_COUNT = 2",
+                  1
+              )
+
+          p.write_text(s)
+
+          print("Risky Thor tuning enabled:")
+          print(" - Default autotune: PREFER_GMEM")
+          print(" - Profile warmup: 2 samples when available")
+          PY
+
+          grep -n -E \
+            'DEFAULT = (BANDWIDTH|PROFILED|PROFILED_IMM|PREFER_GMEM|PREFER_SYSMEM)|MIN_PROFILE_DURATION_COUNT' \
+            src/freedreno/vulkan/tu_autotune.cc | head -20 || true
+
+      - name: Create aggressive API33 cross file
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          cat > android-aarch64.txt <<EOF
+          [binaries]
+          ar = '$NDK_BIN/llvm-ar'
+          c = ['ccache', '$NDK_BIN/aarch64-linux-android33-clang']
+          cpp = ['ccache', '$NDK_BIN/aarch64-linux-android33-clang++', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '--start-no-unused-arguments', '-static-libstdc++', '--end-no-unused-arguments']
+          c_ld = '$NDK_BIN/ld.lld'
+          cpp_ld = '$NDK_BIN/ld.lld'
+          strip = '$NDK_BIN/llvm-strip'
+          ranlib = '$NDK_BIN/llvm-ranlib'
+          pkg-config = ['env', 'PKG_CONFIG_LIBDIR=/nonexistent', '/usr/bin/pkg-config']
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+
+          [built-in options]
+          c_args = [
+            '-O3',
+            '-mtune=cortex-x3',
+            '-fomit-frame-pointer',
+            '-fno-semantic-interposition',
+            '-ffunction-sections',
+            '-fdata-sections'
+          ]
+          cpp_args = [
+            '-O3',
+            '-mtune=cortex-x3',
+            '-fomit-frame-pointer',
+            '-fno-semantic-interposition',
+            '-ffunction-sections',
+            '-fdata-sections'
+          ]
+          c_link_args = [
+            '-Wl,--gc-sections',
+            '-Wl,--icf=all'
+          ]
+          cpp_link_args = [
+            '-Wl,--gc-sections',
+            '-Wl,--icf=all'
+          ]
+          EOF
+
+          cat > native.txt <<EOF
+          [binaries]
+          c = ['ccache', 'clang']
+          cpp = ['ccache', 'clang++']
+          ar = 'llvm-ar'
+          strip = 'llvm-strip'
+          c_ld = 'ld.lld'
+          cpp_ld = 'ld.lld'
+
+          [host_machine]
+          system = 'linux'
+          cpu_family = 'x86_64'
+          cpu = 'x86_64'
+          endian = 'little'
+          EOF
+
+          echo "Android cross file:"
+          cat android-aarch64.txt
+
+      - name: Configure risky Turnip build
+        working-directory: mesa
+        env:
+          CC: clang
+          CXX: clang++
+          AR: llvm-ar
+          RANLIB: llvm-ranlib
+          STRIP: llvm-strip
+          OBJDUMP: llvm-objdump
+          OBJCOPY: llvm-objcopy
+          LDFLAGS: -fuse-ld=lld
+        run: |
+          set -euxo pipefail
+
+          rm -rf build-android-aarch64
+          rm -rf /tmp/turnip-thor-v8-risky
+
+          meson setup build-android-aarch64 \
+            --cross-file android-aarch64.txt \
+            --native-file native.txt \
+            --prefix /tmp/turnip-thor-v8-risky \
+            -Dbuildtype=release \
+            -Db_ndebug=true \
+            -Db_lto=true \
+            -Db_lto_mode=thin \
+            -Dstrip=true \
+            -Dplatforms=android \
+            -Dplatform-sdk-version=33 \
+            -Dandroid-stub=true \
+            -Dandroid-libbacktrace=disabled \
+            -Degl=disabled \
+            -Dgallium-drivers= \
+            -Dvulkan-drivers=freedreno \
+            -Dvulkan-beta=true \
+            -Dfreedreno-kmds=kgsl \
+            -Dvideo-codecs=
+
+      - name: Compile risky Turnip
+        working-directory: mesa
+        run: |
+          set -o pipefail
+          ninja -v -C build-android-aarch64 install 2>&1 \
+            | tee /tmp/thor-v8-risky-build.log
+
+      - name: Inspect compiled driver
+        run: |
+          set -euxo pipefail
+
+          DRIVER="$(find /tmp/turnip-thor-v8-risky mesa/build-android-aarch64 \
+            -type f -name 'libvulkan_freedreno.so' -print -quit)"
+
+          if [ -z "$DRIVER" ] || [ ! -f "$DRIVER" ]; then
+            echo "ERROR: risky build did not produce libvulkan_freedreno.so"
+            echo "Last 160 build lines:"
+            tail -160 /tmp/thor-v8-risky-build.log || true
+            exit 1
+          fi
+
+          echo "Driver:"
+          file "$DRIVER"
+
+          echo "SONAME:"
+          patchelf --print-soname "$DRIVER" || true
+
+          echo "Dependencies:"
+          patchelf --print-needed "$DRIVER" || true
+
+      - name: Package risky Eden driver
+        run: |
+          set -euxo pipefail
+
+          DRIVER="$(find /tmp/turnip-thor-v8-risky mesa/build-android-aarch64 \
+            -type f -name 'libvulkan_freedreno.so' -print -quit)"
+
+          MESA_VERSION="$(tr -d '\r\n' < mesa/VERSION)"
+          MESA_SHA="$(git -C mesa rev-parse --short=12 HEAD)"
+
+          rm -rf package out
+          mkdir -p package out
+
+          cp "$DRIVER" package/libvulkan_freedreno.so
+
+          "$NDK_BIN/llvm-strip" \
+            --strip-unneeded \
+            package/libvulkan_freedreno.so || true
+
+          cat > package/meta.json <<EOF
+          {
+            "schemaVersion": 1,
+            "name": "Thor A740 v8 Risky 60FPS",
+            "description": "Experimental AYN Thor / Adreno 740 Eden driver. Whitebelyash turnip/gen8, Prefer-GMEM, O3, Cortex-X3 scheduling tune, ThinLTO and aggressive LLD ICF.",
+            "author": "Thor A740 Project",
+            "packageVersion": "8-risky",
+            "vendor": "Mesa",
+            "driverVersion": "${MESA_VERSION}-${MESA_SHA}",
+            "minApi": 33,
+            "libraryName": "libvulkan_freedreno.so"
+          }
+          EOF
+
+          ZIP="out/ThorA740-v8-Risky-60FPS-${MESA_VERSION}-${MESA_SHA}.zip"
+
+          (
+            cd package
+            zip -9 "../$ZIP" \
+              libvulkan_freedreno.so \
+              meta.json
+          )
+
+          echo "Created:"
+          ls -lh "$ZIP"
+
+          echo "Package contents:"
+          unzip -l "$ZIP"
+
+      - name: Validate risky Eden package
+        run: |
+          set -euxo pipefail
+
+          ZIP="$(find out -maxdepth 1 -type f -name '*.zip' -print -quit)"
+          test -n "$ZIP"
+          test -f "$ZIP"
+
+          python3 - "$ZIP" <<'PY'
+          import json
+          import sys
+          import zipfile
+
+          path = sys.argv[1]
+
+          with zipfile.ZipFile(path) as z:
+              files = {
+                  x for x in z.namelist()
+                  if not x.endswith("/")
+              }
+
+              expected = {
+                  "meta.json",
+                  "libvulkan_freedreno.so"
+              }
+
+              if files != expected:
+                  raise SystemExit(
+                      f"Wrong ZIP contents: {sorted(files)}"
+                  )
+
+              meta = json.loads(z.read("meta.json"))
+
+              assert meta["libraryName"] == "libvulkan_freedreno.so"
+              assert meta["minApi"] == 33
+              assert meta["packageVersion"] == "8-risky"
+
+          print("Thor A740 v8 risky Eden package validation PASSED")
+          PY
+
+      - name: Upload risky driver
+        uses: actions/upload-artifact@v6
+        with:
+          name: ThorA740-v8-Risky-60FPS
+          path: out/*.zip
+          if-no-files-found: error
