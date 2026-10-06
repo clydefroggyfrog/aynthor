@@ -1,0 +1,305 @@
+name: Build Thor A740 v7 60FPS Performance
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_ref:
+        description: "Whitebelyash Mesa branch, tag, or commit"
+        required: true
+        default: "turnip/gen8"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install build tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl unzip zip ninja-build pkg-config \
+            flex bison clang lld llvm ccache \
+            python3 python3-pip patchelf glslang-tools patch file
+          python3 -m pip install --break-system-packages -U \
+            meson mako pyyaml packaging
+
+      - name: Download Android NDK r29
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 3 \
+            https://dl.google.com/android/repository/android-ndk-r29-linux.zip \
+            -o /tmp/android-ndk.zip
+          unzip -q /tmp/android-ndk.zip -d "$HOME"
+
+          NDK_ROOT="$HOME/android-ndk-r29"
+          NDK_BIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          echo "NDK_ROOT=$NDK_ROOT" >> "$GITHUB_ENV"
+          echo "NDK_BIN=$NDK_BIN" >> "$GITHUB_ENV"
+
+          test -x "$NDK_BIN/aarch64-linux-android33-clang"
+          test -x "$NDK_BIN/aarch64-linux-android33-clang++"
+
+      - name: Download performance Turnip source
+        env:
+          MESA_REF: ${{ inputs.mesa_ref }}
+        run: |
+          set -euxo pipefail
+          rm -rf mesa
+
+          git clone --filter=blob:none \
+            https://github.com/whitebelyash/mesa-unified.git mesa
+
+          git -C mesa fetch --depth=1 origin "$MESA_REF"
+          git -C mesa checkout --detach FETCH_HEAD
+
+          echo "Mesa commit:"
+          git -C mesa rev-parse HEAD
+          echo "Mesa version:"
+          cat mesa/VERSION
+
+      - name: Apply Android compatibility fixes
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          sed -i \
+            's/typedef const native_handle_t\* buffer_handle_t;/typedef void* buffer_handle_t;/g' \
+            include/android_stub/cutils/native_handle.h || true
+
+          sed -i \
+            's/, hnd->handle/, (void *)hnd->handle/g' \
+            src/util/u_gralloc/u_gralloc_fallback.c || true
+
+          sed -i -E \
+            's/([a-z_]+)->handle->/((const native_handle_t *)\1->handle)->/g' \
+            src/vulkan/runtime/vk_android.c || true
+
+          sed -i \
+            's/anb->handle->/((const native_handle_t *)anb->handle)->/g' \
+            src/vulkan/runtime/vk_android.c || true
+
+          sed -i \
+            "/-Werror=gnu-empty-initializer/d" \
+            meson.build || true
+
+      - name: Apply Thor A740 performance tuning
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("src/freedreno/vulkan/tu_autotune.cc")
+          s = p.read_text()
+
+          old_default = "DEFAULT = BANDWIDTH"
+          new_default = "DEFAULT = PROFILED"
+
+          if old_default not in s and new_default not in s:
+              raise SystemExit("Could not find Turnip autotune default in tu_autotune.cc")
+
+          s = s.replace(old_default, new_default, 1)
+
+          # Learn recurring render-pass behavior sooner on emulator workloads.
+          old_samples = "MIN_PROFILE_DURATION_COUNT = 5"
+          new_samples = "MIN_PROFILE_DURATION_COUNT = 3"
+          if old_samples in s:
+              s = s.replace(old_samples, new_samples, 1)
+
+          p.write_text(s)
+
+          check = p.read_text()
+          if new_default not in check:
+              raise SystemExit("PROFILED autotune patch did not apply")
+
+          print("Thor v7 tuning enabled:")
+          print(" - Turnip default GMEM/SYSMEM autotuner: PROFILED")
+          print(" - Profiling warm-up samples: 3 when supported by this source")
+          PY
+
+          grep -n \
+            -E 'DEFAULT = (PROFILED|BANDWIDTH)|MIN_PROFILE_DURATION_COUNT' \
+            src/freedreno/vulkan/tu_autotune.cc | head -20
+
+      - name: Create AYN Thor API33 cross file
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          cat > android-aarch64.txt <<EOF
+          [binaries]
+          ar = '$NDK_BIN/llvm-ar'
+          c = ['ccache', '$NDK_BIN/aarch64-linux-android33-clang']
+          cpp = ['ccache', '$NDK_BIN/aarch64-linux-android33-clang++', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '--start-no-unused-arguments', '-static-libstdc++', '--end-no-unused-arguments']
+          c_ld = '$NDK_BIN/ld.lld'
+          cpp_ld = '$NDK_BIN/ld.lld'
+          strip = '$NDK_BIN/llvm-strip'
+          ranlib = '$NDK_BIN/llvm-ranlib'
+          pkg-config = ['env', 'PKG_CONFIG_LIBDIR=/nonexistent', '/usr/bin/pkg-config']
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+
+          [built-in options]
+          c_args = ['-O3', '-mtune=cortex-x3', '-fomit-frame-pointer', '-fno-semantic-interposition', '-ffunction-sections', '-fdata-sections']
+          cpp_args = ['-O3', '-mtune=cortex-x3', '-fomit-frame-pointer', '-fno-semantic-interposition', '-ffunction-sections', '-fdata-sections']
+          c_link_args = ['-Wl,--gc-sections', '-Wl,--icf=safe']
+          cpp_link_args = ['-Wl,--gc-sections', '-Wl,--icf=safe']
+          EOF
+
+          cat android-aarch64.txt
+
+      - name: Configure Turnip 60FPS Performance
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+          rm -rf build-android-aarch64 /tmp/turnip-thor-v7
+
+          meson setup build-android-aarch64 \
+            --cross-file android-aarch64.txt \
+            --prefix /tmp/turnip-thor-v7 \
+            -Dbuildtype=release \
+            -Db_ndebug=true \
+            -Db_lto=true \
+            -Db_lto_mode=thin \
+            -Dstrip=true \
+            -Dplatforms=android \
+            -Dplatform-sdk-version=33 \
+            -Dandroid-stub=true \
+            -Dandroid-libbacktrace=disabled \
+            -Degl=disabled \
+            -Dgallium-drivers= \
+            -Dvulkan-drivers=freedreno \
+            -Dvulkan-beta=true \
+            -Dfreedreno-kmds=kgsl \
+            -Dvideo-codecs=
+
+      - name: Compile Turnip
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+          ninja -C build-android-aarch64 install
+
+      - name: Inspect compiled driver
+        run: |
+          set -euxo pipefail
+
+          DRIVER="$(find /tmp/turnip-thor-v7 mesa/build-android-aarch64 \
+            -type f -name 'libvulkan_freedreno.so' -print -quit)"
+
+          test -n "$DRIVER"
+          test -f "$DRIVER"
+
+          echo "Driver:"
+          file "$DRIVER"
+
+          echo "Dependencies:"
+          patchelf --print-needed "$DRIVER" || true
+
+      - name: Package Eden driver
+        run: |
+          set -euxo pipefail
+
+          DRIVER="$(find /tmp/turnip-thor-v7 mesa/build-android-aarch64 \
+            -type f -name 'libvulkan_freedreno.so' -print -quit)"
+
+          MESA_VERSION="$(tr -d '\r\n' < mesa/VERSION)"
+          MESA_SHA="$(git -C mesa rev-parse --short=12 HEAD)"
+
+          rm -rf package out
+          mkdir -p package out
+
+          cp "$DRIVER" package/libvulkan_freedreno.so
+          "$NDK_BIN/llvm-strip" \
+            --strip-unneeded package/libvulkan_freedreno.so || true
+
+          cat > package/meta.json <<EOF
+          {
+            "schemaVersion": 1,
+            "name": "Thor A740 v7 60FPS Performance",
+            "description": "Aggressive AYN Thor Snapdragon 8 Gen 2 / Adreno 740 Turnip build for Eden. Whitebelyash Mesa base, profiled GMEM/SYSMEM autotuning, ThinLTO, Android API 33.",
+            "author": "Thor A740 Project",
+            "packageVersion": "7",
+            "vendor": "Mesa",
+            "driverVersion": "${MESA_VERSION}-${MESA_SHA}",
+            "minApi": 33,
+            "libraryName": "libvulkan_freedreno.so"
+          }
+          EOF
+
+          ZIP="out/ThorA740-v7-60FPS-${MESA_VERSION}-${MESA_SHA}.zip"
+
+          (
+            cd package
+            zip -9 "../$ZIP" \
+              libvulkan_freedreno.so \
+              meta.json
+          )
+
+          echo "Created:"
+          ls -lh "$ZIP"
+          unzip -l "$ZIP"
+
+      - name: Validate Eden package
+        run: |
+          set -euxo pipefail
+
+          ZIP="$(find out -maxdepth 1 -type f -name '*.zip' -print -quit)"
+          test -n "$ZIP"
+
+          python3 - "$ZIP" <<'PY'
+          import json
+          import sys
+          import zipfile
+
+          path = sys.argv[1]
+
+          with zipfile.ZipFile(path) as z:
+              files = {
+                  x for x in z.namelist()
+                  if not x.endswith("/")
+              }
+
+              expected = {
+                  "meta.json",
+                  "libvulkan_freedreno.so"
+              }
+
+              if files != expected:
+                  raise SystemExit(
+                      f"Wrong ZIP contents: {sorted(files)}"
+                  )
+
+              meta = json.loads(z.read("meta.json"))
+
+              if meta.get("libraryName") != "libvulkan_freedreno.so":
+                  raise SystemExit("libraryName is wrong")
+
+              if meta.get("minApi") != 33:
+                  raise SystemExit("minApi is wrong")
+
+              if meta.get("packageVersion") != "7":
+                  raise SystemExit("packageVersion is wrong")
+
+          print("Thor A740 v7 Eden package validation PASSED")
+          PY
+
+      - name: Upload Thor A740 v7 driver
+        uses: actions/upload-artifact@v6
+        with:
+          name: ThorA740-v7-60FPS-Performance
+          path: out/*.zip
+          if-no-files-found: error
