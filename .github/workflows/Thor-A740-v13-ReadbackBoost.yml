@@ -1,0 +1,522 @@
+name: Build Thor A740 v13 ReadbackBoost
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_ref:
+        description: "Mesa branch, tag, or commit"
+        required: true
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - stock-r2d
+          - r3d-rgba8
+          - r3d-rgba8-cachecoherent
+
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install build tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl unzip zip ninja-build pkg-config \
+            flex bison clang lld llvm ccache \
+            python3 python3-pip patchelf glslang-tools patch file
+          python3 -m pip install --break-system-packages -U \
+            meson mako pyyaml packaging
+
+      - name: Download Android NDK r29
+        run: |
+          set -euxo pipefail
+
+          curl -fL --retry 3 \
+            https://dl.google.com/android/repository/android-ndk-r29-linux.zip \
+            -o /tmp/android-ndk.zip
+
+          unzip -q /tmp/android-ndk.zip -d "$HOME"
+
+          NDK_ROOT="$HOME/android-ndk-r29"
+          NDK_BIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          echo "NDK_ROOT=$NDK_ROOT" >> "$GITHUB_ENV"
+          echo "NDK_BIN=$NDK_BIN" >> "$GITHUB_ENV"
+
+          test -x "$NDK_BIN/aarch64-linux-android33-clang"
+          test -x "$NDK_BIN/aarch64-linux-android33-clang++"
+
+      - name: Download Mesa
+        env:
+          MESA_REF: ${{ inputs.mesa_ref }}
+        run: |
+          set -euxo pipefail
+
+          rm -rf mesa
+
+          git clone --filter=blob:none \
+            https://github.com/mirror/mesa.git \
+            mesa
+
+          git -C mesa fetch --depth=1 origin "$MESA_REF"
+          git -C mesa checkout --detach FETCH_HEAD
+
+          echo "Mesa commit:"
+          git -C mesa rev-parse HEAD
+
+          echo "Mesa version:"
+          cat mesa/VERSION
+
+      - name: Apply Android compatibility fixes
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          sed -i \
+            's/typedef const native_handle_t\* buffer_handle_t;/typedef void* buffer_handle_t;/g' \
+            include/android_stub/cutils/native_handle.h || true
+
+          sed -i \
+            's/, hnd->handle/, (void *)hnd->handle/g' \
+            src/util/u_gralloc/u_gralloc_fallback.c || true
+
+          sed -i -E \
+            's/([a-z_]+)->handle->/((const native_handle_t *)\1->handle)->/g' \
+            src/vulkan/runtime/vk_android.c || true
+
+          sed -i \
+            's/anb->handle->/((const native_handle_t *)anb->handle)->/g' \
+            src/vulkan/runtime/vk_android.c || true
+
+          sed -i \
+            "/-Werror=gnu-empty-initializer/d" \
+            meson.build || true
+
+      - name: Use SYSMEM-friendly bandwidth autotuner
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          p = Path("src/freedreno/vulkan/tu_autotune.cc")
+          if not p.exists():
+              raise SystemExit("ERROR: tu_autotune.cc not found")
+
+          s = p.read_text()
+
+          pattern = (
+              r"DEFAULT\s*=\s*"
+              r"(?:BANDWIDTH|PROFILED|PROFILED_IMM|PREFER_GMEM|PREFER_SYSMEM)"
+          )
+
+          m = re.search(pattern, s)
+          if not m:
+              raise SystemExit("ERROR: autotune DEFAULT selector not found")
+
+          print("Original autotune selector:", m.group(0))
+
+          s, n = re.subn(
+              pattern,
+              "DEFAULT = BANDWIDTH",
+              s,
+              count=1
+          )
+
+          if n != 1:
+              raise SystemExit("ERROR: failed to select BANDWIDTH")
+
+          p.write_text(s)
+          print("v13 autotune: BANDWIDTH")
+          PY
+
+      - name: Verify or apply A740 PC_MODE_CNTL performance value
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          p = Path("src/freedreno/common/freedreno_devices.py")
+          if not p.exists():
+              raise SystemExit("ERROR: freedreno_devices.py not found")
+
+          s = p.read_text()
+
+          # Modern Mesa should already contain 0x1f1f for the relevant A7xx
+          # profile. If an older requested mesa_ref still carries the old
+          # 0x3f test value, replace only the exact PC_MODE_CNTL assignment.
+          if re.search(
+              r"A6XXRegs\.REG_A6XX_PC_MODE_CNTL\s*,\s*0x(?:0000)?1f1f",
+              s,
+              re.I,
+          ):
+              print("PC_MODE_CNTL 0x1f1f already present")
+          else:
+              old = re.compile(
+                  r"(A6XXRegs\.REG_A6XX_PC_MODE_CNTL\s*,\s*)0x(?:000000)?3f",
+                  re.I,
+              )
+              s, n = old.subn(r"\g<1>0x1f1f", s, count=1)
+              if n != 1:
+                  raise SystemExit(
+                      "ERROR: PC_MODE_CNTL 0x1f1f not present and "
+                      "old 0x3f assignment was not found"
+                  )
+              p.write_text(s)
+              print("Patched PC_MODE_CNTL to 0x1f1f")
+
+          if "0x1f1f" not in p.read_text().lower():
+              raise SystemExit("ERROR: PC_MODE_CNTL verification failed")
+          PY
+
+          grep -n \
+            'REG_A6XX_PC_MODE_CNTL' \
+            src/freedreno/common/freedreno_devices.py | head -20
+
+      - name: Apply v13 readback experiment
+        working-directory: mesa
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          variant = os.environ["VARIANT"]
+          print("Building v13 variant:", variant)
+
+          if variant == "stock-r2d":
+              print("Keeping upstream R2D image-to-buffer path")
+              raise SystemExit(0)
+
+          p = Path("src/freedreno/vulkan/tu_clear_blit.cc")
+          if not p.exists():
+              raise SystemExit("ERROR: tu_clear_blit.cc not found")
+
+          s = p.read_text()
+
+          marker = """   if (dst_format == PIPE_FORMAT_Y8_UNORM) {
+              ops = &r3d_ops<CHIP>;
+              blit_param = R3D_COPY;
+           }"""
+
+          # Whitespace can move between Mesa revisions, so use a smaller
+          # stable anchor if the exact block formatting is different.
+          if marker not in s:
+              anchor = """      ops = &r3d_ops<CHIP>;
+              blit_param = R3D_COPY;
+           }
+
+           VkOffset3D offset = info->imageOffset;"""
+
+              injection = """      ops = &r3d_ops<CHIP>;
+              blit_param = R3D_COPY;
+           }
+
+           /*
+            * Thor A740 v13 experiment:
+            * Eden profiling showed recurring RGBA8 image->buffer readbacks
+            * dominating frame time. On A7XX, route large/common RGBA8
+            * readbacks through the programmable R3D copy path instead of
+            * the default R2D path.
+            */
+           if constexpr (CHIP >= A7XX) {
+              if (src_format == PIPE_FORMAT_R8G8B8A8_UNORM &&
+                  dst_format == PIPE_FORMAT_R8G8B8A8_UNORM) {
+                 ops = &r3d_ops<CHIP>;
+                 blit_param = R3D_COPY;
+              }
+           }
+
+           VkOffset3D offset = info->imageOffset;"""
+
+              if anchor not in s:
+                  raise SystemExit(
+                      "ERROR: could not locate image-to-buffer copy anchor"
+                  )
+
+              s = s.replace(anchor, injection, 1)
+          else:
+              replacement = marker + """
+
+           /*
+            * Thor A740 v13 experiment:
+            * route RGBA8 image->buffer readbacks through R3D on A7XX.
+            */
+           if constexpr (CHIP >= A7XX) {
+              if (src_format == PIPE_FORMAT_R8G8B8A8_UNORM &&
+                  dst_format == PIPE_FORMAT_R8G8B8A8_UNORM) {
+                 ops = &r3d_ops<CHIP>;
+                 blit_param = R3D_COPY;
+              }
+           }"""
+              s = s.replace(marker, replacement, 1)
+
+          p.write_text(s)
+
+          verify = p.read_text()
+          if "Thor A740 v13 experiment" not in verify:
+              raise SystemExit("ERROR: R3D readback patch verification failed")
+
+          print("Enabled A7XX R3D path for RGBA8 image-to-buffer copies")
+
+          if variant == "r3d-rgba8-cachecoherent":
+              d = Path("src/freedreno/vulkan/tu_drirc_gen.py")
+              ds = d.read_text()
+
+              old = """B("tu_override_uncached_as_cache_coherent", False,"""
+              new = """B("tu_override_uncached_as_cache_coherent", True,"""
+
+              if old in ds:
+                  ds = ds.replace(old, new, 1)
+                  d.write_text(ds)
+                  print("Enabled cache-coherent host allocation override")
+              elif new in ds:
+                  print("Cache-coherent override already defaults true")
+              else:
+                  raise SystemExit(
+                      "ERROR: cache-coherent drirc option not found"
+                  )
+          PY
+
+          grep -n -A16 -B8 \
+            'Thor A740 v13 experiment' \
+            src/freedreno/vulkan/tu_clear_blit.cc || true
+
+          grep -n \
+            'tu_override_uncached_as_cache_coherent' \
+            src/freedreno/vulkan/tu_drirc_gen.py || true
+
+      - name: Create A740 performance build files
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          cat > android-aarch64.txt <<EOF
+          [binaries]
+          ar = '$NDK_BIN/llvm-ar'
+          c = ['ccache', '$NDK_BIN/aarch64-linux-android33-clang']
+          cpp = ['ccache', '$NDK_BIN/aarch64-linux-android33-clang++', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '--start-no-unused-arguments', '-static-libstdc++', '--end-no-unused-arguments']
+          c_ld = '$NDK_BIN/ld.lld'
+          cpp_ld = '$NDK_BIN/ld.lld'
+          strip = '$NDK_BIN/llvm-strip'
+          ranlib = '$NDK_BIN/llvm-ranlib'
+          pkg-config = ['env', 'PKG_CONFIG_LIBDIR=/nonexistent', '/usr/bin/pkg-config']
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+          EOF
+
+          cat > native.txt <<EOF
+          [build_machine]
+          c = ['ccache', 'clang']
+          cpp = ['ccache', 'clang++']
+          ar = 'llvm-ar'
+          strip = 'llvm-strip'
+          c_ld = 'ld.lld'
+          cpp_ld = 'ld.lld'
+          system = 'linux'
+          cpu_family = 'x86_64'
+          cpu = 'x86_64'
+          endian = 'little'
+          EOF
+
+      - name: Configure v13 performance build
+        working-directory: mesa
+        run: |
+          set -euxo pipefail
+
+          export CC=clang
+          export CXX=clang++
+          export AR=llvm-ar
+          export RANLIB=llvm-ranlib
+          export STRIP=llvm-strip
+          export OBJDUMP=llvm-objdump
+          export OBJCOPY=llvm-objcopy
+
+          export LDFLAGS="-fuse-ld=lld -flto=thin"
+          export CFLAGS="-D__ANDROID__ -O3 -fno-plt -flto=thin -Wno-error -Wno-deprecated-declarations -Wno-incompatible-pointer-types-discards-qualifiers -Wno-incompatible-pointer-types"
+          export CXXFLAGS="-D__ANDROID__ -O3 -fno-plt -flto=thin -Wno-error -Wno-deprecated-declarations -Wno-incompatible-pointer-types-discards-qualifiers -Wno-incompatible-pointer-types"
+
+          rm -rf build-android-aarch64
+          rm -rf /tmp/turnip-thor-v13
+
+          meson setup build-android-aarch64 \
+            --cross-file android-aarch64.txt \
+            --native-file native.txt \
+            --prefix /tmp/turnip-thor-v13 \
+            -Dbuildtype=release \
+            -Db_ndebug=true \
+            -Dstrip=true \
+            -Dplatforms=android \
+            -Dvideo-codecs= \
+            -Dplatform-sdk-version=33 \
+            -Dandroid-stub=true \
+            -Dandroid-libbacktrace=disabled \
+            -Dgallium-drivers= \
+            -Dvulkan-drivers=freedreno \
+            -Dvulkan-beta=true \
+            -Dfreedreno-kmds=kgsl \
+            -Degl=disabled
+
+      - name: Compile v13
+        working-directory: mesa
+        run: |
+          set -o pipefail
+
+          export CC=clang
+          export CXX=clang++
+          export AR=llvm-ar
+          export RANLIB=llvm-ranlib
+          export STRIP=llvm-strip
+          export OBJDUMP=llvm-objdump
+          export OBJCOPY=llvm-objcopy
+
+          export LDFLAGS="-fuse-ld=lld -flto=thin"
+          export CFLAGS="-D__ANDROID__ -O3 -fno-plt -flto=thin -Wno-error -Wno-deprecated-declarations -Wno-incompatible-pointer-types-discards-qualifiers -Wno-incompatible-pointer-types"
+          export CXXFLAGS="-D__ANDROID__ -O3 -fno-plt -flto=thin -Wno-error -Wno-deprecated-declarations -Wno-incompatible-pointer-types-discards-qualifiers -Wno-incompatible-pointer-types"
+
+          ninja -v -C build-android-aarch64 install 2>&1 \
+            | tee /tmp/thor-v13-build.log
+
+      - name: Inspect compiled driver
+        run: |
+          set -euxo pipefail
+
+          DRIVER="$(find /tmp/turnip-thor-v13 mesa/build-android-aarch64 \
+            -type f -name 'libvulkan_freedreno.so' -print -quit)"
+
+          if [ -z "$DRIVER" ] || [ ! -f "$DRIVER" ]; then
+            echo "ERROR: libvulkan_freedreno.so was not produced."
+            tail -200 /tmp/thor-v13-build.log || true
+            exit 1
+          fi
+
+          file "$DRIVER"
+          patchelf --print-needed "$DRIVER" || true
+
+      - name: Package Eden driver
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euxo pipefail
+
+          DRIVER="$(find /tmp/turnip-thor-v13 mesa/build-android-aarch64 \
+            -type f -name 'libvulkan_freedreno.so' -print -quit)"
+
+          MESA_VERSION="$(tr -d '\r\n' < mesa/VERSION)"
+          MESA_SHA="$(git -C mesa rev-parse --short=12 HEAD)"
+
+          case "$VARIANT" in
+            stock-r2d)
+              DISPLAY="R2D Control"
+              ;;
+            r3d-rgba8)
+              DISPLAY="R3D RGBA8 Readback"
+              ;;
+            r3d-rgba8-cachecoherent)
+              DISPLAY="R3D RGBA8 + CacheCoherent"
+              ;;
+          esac
+
+          rm -rf package out
+          mkdir -p package out
+
+          cp "$DRIVER" package/libvulkan_freedreno.so
+          "$NDK_BIN/llvm-strip" \
+            --strip-unneeded \
+            package/libvulkan_freedreno.so || true
+
+          cat > package/meta.json <<EOF
+          {
+            "schemaVersion": 1,
+            "name": "Thor A740 v13 ${DISPLAY}",
+            "description": "Trace-guided AYN Thor Adreno 740 Turnip build for Eden. SYSMEM-friendly bandwidth autotune with ${DISPLAY}.",
+            "author": "Thor A740 Project",
+            "packageVersion": "13-${VARIANT}",
+            "vendor": "Mesa",
+            "driverVersion": "${MESA_VERSION}-${MESA_SHA}",
+            "minApi": 33,
+            "libraryName": "libvulkan_freedreno.so"
+          }
+          EOF
+
+          ZIP="out/ThorA740-v13-${VARIANT}-${MESA_VERSION}-${MESA_SHA}.zip"
+
+          (
+            cd package
+            zip -9 "../$ZIP" \
+              libvulkan_freedreno.so \
+              meta.json
+          )
+
+          echo "Created:"
+          ls -lh "$ZIP"
+          unzip -l "$ZIP"
+
+      - name: Validate Eden package
+        run: |
+          set -euxo pipefail
+
+          ZIP="$(find out -maxdepth 1 -type f -name '*.zip' -print -quit)"
+          test -n "$ZIP"
+
+          python3 - "$ZIP" <<'PY'
+          import json
+          import sys
+          import zipfile
+
+          path = sys.argv[1]
+
+          with zipfile.ZipFile(path) as z:
+              files = {
+                  x for x in z.namelist()
+                  if not x.endswith("/")
+              }
+
+              expected = {
+                  "meta.json",
+                  "libvulkan_freedreno.so"
+              }
+
+              if files != expected:
+                  raise SystemExit(
+                      f"Wrong ZIP contents: {sorted(files)}"
+                  )
+
+              meta = json.loads(z.read("meta.json"))
+              assert meta["libraryName"] == "libvulkan_freedreno.so"
+              assert meta["minApi"] == 33
+              assert str(meta["packageVersion"]).startswith("13-")
+
+          print("Thor A740 v13 package validation PASSED")
+          PY
+
+      - name: Upload v13 variant
+        uses: actions/upload-artifact@v6
+        with:
+          name: ThorA740-v13-${{ matrix.variant }}
+          path: out/*.zip
+          if-no-files-found: error
